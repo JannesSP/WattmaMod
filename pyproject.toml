@@ -1,0 +1,3 @@
+[tool.uv.extra-build-dependencies]
+causal-conv1d = ["torch==2.1.1"]
+mamba-ssm = ["torch==2.1.1"]

@@ -33,7 +33,14 @@ For questions related to code usage, execution, or debugging, please contact: **
 
 Install dependencies from `requirements.txt` first:
 
+### using pip
+
+```bash
 pip install -r requirements.txt
+pip install -r requirements-gpu.txt --index-url https://download.pytorch.org/whl/cu118 # this required cuda!
+pip install causal-conv1d==1.5.0.post8 --no-build-isolation
+pip install mamba-ssm==2.2.4 --no-build-isolation
+```
 
 Additional note: the Mamba environment needs to be configured manually.
 
@@ -41,17 +48,25 @@ A CUDA-capable NVIDIA GPU is required to run the software. CPU-only execution is
 
 Typical installation time is approximately 10–30 minutes on a normal desktop computer, depending on the system environment and network conditions.
 
-# install PyTorch
+### using conda (TODO: fix this documentation)
 
+install PyTorch
+
+```bash
 conda install cudatoolkit==11.8 -c nvidia   # CUDA 11.8 is required
-pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu118
 conda install -c "nvidia/label/cuda-11.8.0" cuda-nvcc
 conda install packaging
+```
 
-# install extra packages for Mamba
-# pip install causal-conv1d
-# pip install mamba-ssm
+# install extra packages for Mamba (not conda mamba)
 
+This requires cuda!
+
+```bash
+pip install causal-conv1d
+pip install mamba-ssm
+```
 Offline installation is recommended for faster setup:
 
 * `causal-conv1d`: [https://github.com/Dao-AILab/causal-conv1d/releases/](https://github.com/Dao-AILab/causal-conv1d/releases/)
