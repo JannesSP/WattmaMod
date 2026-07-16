@@ -7,9 +7,25 @@ from pathlib import Path
 from tqdm.auto import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from tqdm.auto import tqdm
+import zstandard as zstd
 REF_DICT = None
 P5_READER = None
 P5_PATH = None
+
+def open_zstd_writer(path, level=3) -> tuple:
+    """
+    Open a UTF-8 text writer compressed with zstd.
+    Returns
+    -------
+    stream : zstd.ZstdCompressionWriter
+        A stream writer that can be used to write text data.
+    fh : file object
+        The underlying file object that was opened for writing.
+    """
+    fh = open(path, "wb")
+    compressor = zstd.ZstdCompressor(level=level)
+    stream = compressor.stream_writer(fh)
+    return stream, fh
 
 def reverse_non_gap_segments(parts, dwell_padded, ref_aligned_sequence, na_token="NA"):
     n = len(parts)
@@ -383,90 +399,96 @@ def main(args):
     global REF_DICT
     REF_DICT = load_fasta_dict(args.ref)
     
-    with pysam.AlignmentFile(args.bam, "rb") as bam, \
-            open(args.out, "w", encoding="utf-8") as out:
+    with pysam.AlignmentFile(args.bam, "rb") as bam:
+        zstd_stream, raw_out = open_zstd_writer(args.out)
+        out = zstd_stream
                 
-        out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n")
-        if args.workers and args.workers > 1:
-            with ProcessPoolExecutor(max_workers=args.workers,initializer=init_worker,
-                initargs=(args.pod5, REF_DICT),) as ex:
-                tasks = iter_tasks(bam, REF_DICT)
-                for line in tqdm(
-                    ex.map(process_read, tasks, chunksize=256),
-                    total=None,
-                    unit="reads",
-                    desc="Processing BAM",
-                    dynamic_ncols=True,
-                ):
-                    if line:
-                        out.write(line + "\n")
-        else:
-            with pod5.DatasetReader(args.pod5) as p5:
-                it = bam.fetch(until_eof=True)
-                for rec in tqdm(
-                    it,
-                    total=None,
-                    unit="reads",
-                    desc="Processing BAM",
-                    dynamic_ncols=True,
-                ):
-                    if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
-                        continue
-                    chrom = rec.reference_name
-                    if chrom not in REF_DICT:
-                        continue
-                    if not rec.has_tag("ur") or not rec.has_tag("ul"):
-                        continue
-
-                    read_id = rec.query_name.split()[0]
-
-                    try:
-                        ur_tag = rec.get_tag("ur")
-                        ul_tag = rec.get_tag("ul")
-                        
-                        ur_start = get_ur_start(ur_tag)
-                        if ur_start is None:
+        try:
+            out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n").encode("utf-8")
+            if args.workers and args.workers > 1:
+                with ProcessPoolExecutor(max_workers=args.workers,initializer=init_worker,
+                    initargs=(args.pod5, REF_DICT),) as ex:
+                    tasks = iter_tasks(bam, REF_DICT)
+                    for line in tqdm(
+                        ex.map(process_read, tasks, chunksize=256),
+                        total=None,
+                        unit="reads",
+                        desc="Processing BAM",
+                        dynamic_ncols=True,
+                    ):
+                        if line:
+                            out.write(f"{line}\n").encode("utf-8")
+            else:
+                with pod5.DatasetReader(args.pod5) as p5:
+                    it = bam.fetch(until_eof=True)
+                    for rec in tqdm(
+                        it,
+                        total=None,
+                        unit="reads",
+                        desc="Processing BAM",
+                        dynamic_ncols=True,
+                    ):
+                        if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
                             continue
-                        start_pos_1based = ur_start + 1
-
-                        pod5_read = p5.get_read(read_id)
-                        sig = getattr(pod5_read, "signal", None)
-                        if sig is None:
-                            sig = getattr(pod5_read, "raw_signal", None)
-                        if sig is None:
+                        chrom = rec.reference_name
+                        if chrom not in REF_DICT:
                             continue
-                        
-                        sig_arr = np.asarray(sig, dtype=np.int32)
-                        ref_aligned, read_aligned, qual_str = \
-                            extract_aligned_sequences_for_ur_region(
+                        if not rec.has_tag("ur") or not rec.has_tag("ul"):
+                            continue
+
+                        read_id = rec.query_name.split()[0]
+
+                        try:
+                            ur_tag = rec.get_tag("ur")
+                            ul_tag = rec.get_tag("ul")
+                            
+                            ur_start = get_ur_start(ur_tag)
+                            if ur_start is None:
+                                continue
+                            start_pos_1based = ur_start + 1
+
+                            pod5_read = p5.get_read(read_id)
+                            sig = getattr(pod5_read, "signal", None)
+                            if sig is None:
+                                sig = getattr(pod5_read, "raw_signal", None)
+                            if sig is None:
+                                continue
+                            
+                            sig_arr = np.asarray(sig, dtype=np.int32)
+                            ref_aligned, read_aligned, qual_str = \
+                                extract_aligned_sequences_for_ur_region(
+                                    chrom,
+                                    rec.reference_start,
+                                    rec.cigartuples,
+                                    rec.query_sequence,
+                                    rec.query_qualities,
+                                    REF_DICT,   
+                                    ur_tag,
+                                )
+                            if ref_aligned is None:
+                                continue
+
+                            signal, dwell_str = extract_signal(ul_tag, sig_arr, ref_aligned)
+
+                            line = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
+                                read_id,
                                 chrom,
-                                rec.reference_start,
-                                rec.cigartuples,
-                                rec.query_sequence,
-                                rec.query_qualities,
-                                REF_DICT,   
-                                ur_tag,
+                                start_pos_1based,
+                                ref_aligned,
+                                qual_str,
+                                read_aligned,
+                                dwell_str,
+                                signal,
                             )
-                        if ref_aligned is None:
+                            out.write(line + "\n").encode("utf-8")
+
+                        except Exception as e:
+                            print(f"Error processing read {read_id}: {e}", file=sys.stderr)
                             continue
-
-                        signal, dwell_str = extract_signal(ul_tag, sig_arr, ref_aligned)
-
-                        line = "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
-                            read_id,
-                            chrom,
-                            start_pos_1based,
-                            ref_aligned,
-                            qual_str,
-                            read_aligned,
-                            dwell_str,
-                            signal,
-                        )
-                        out.write(line + "\n")
-
-                    except Exception as e:
-                        print(f"Error processing read {read_id}: {e}", file=sys.stderr)
-                        continue
+        finally:
+            zstd_stream.flush(zstd.FLUSH_FRAME)
+            zstd_stream.close()
+            raw_out.close()
 
 
 if __name__ == "__main__":
@@ -474,7 +496,7 @@ if __name__ == "__main__":
     parser.add_argument("--bam",  required=True,  help="Input BAM file path")
     parser.add_argument("--pod5", required=True,  help="Input POD5 path (file or directory)")
     parser.add_argument("--ref",  required=True,  help="Reference FASTA file path")
-    parser.add_argument("--out",  required=True,  help="Output TSV file path")
+    parser.add_argument("--out",  required=True,  help="Output zstd-compressed TSV file path (.tsv.zst)")
     parser.add_argument("--workers",type=int,default=4,help="",)
 
     args = parser.parse_args()
