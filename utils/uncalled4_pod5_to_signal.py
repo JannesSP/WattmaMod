@@ -404,7 +404,7 @@ def main(args):
         out = zstd_stream
                 
         try:
-            out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n").encode("utf-8")
+            out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n".encode("utf-8"))
             if args.workers and args.workers > 1:
                 with ProcessPoolExecutor(max_workers=args.workers,initializer=init_worker,
                     initargs=(args.pod5, REF_DICT),) as ex:
@@ -417,7 +417,7 @@ def main(args):
                         dynamic_ncols=True,
                     ):
                         if line:
-                            out.write(f"{line}\n").encode("utf-8")
+                            out.write(f"{line}\n".encode("utf-8"))
             else:
                 with pod5.DatasetReader(args.pod5) as p5:
                     it = bam.fetch(until_eof=True)
@@ -480,7 +480,7 @@ def main(args):
                                 dwell_str,
                                 signal,
                             )
-                            out.write(line + "\n").encode("utf-8")
+                            out.write(f"{line}\n".encode("utf-8"))
 
                         except Exception as e:
                             print(f"Error processing read {read_id}: {e}", file=sys.stderr)
