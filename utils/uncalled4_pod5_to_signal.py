@@ -22,6 +22,8 @@ def open_zstd_writer(path, level=3) -> tuple:
     fh : file object
         The underlying file object that was opened for writing.
     """
+    if not path.endswith(".zst"):
+        path += ".zst"
     fh = open(path, "wb")
     compressor = zstd.ZstdCompressor(level=level)
     stream = compressor.stream_writer(fh)
