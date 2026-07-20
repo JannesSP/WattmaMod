@@ -3,8 +3,7 @@ import sys
 import argparse
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset,get_worker_info,IterableDataset
-from collections import Counter
+from torch.utils.data import DataLoader, get_worker_info, IterableDataset
 from pathlib import Path
 CUR_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CUR_DIR.parent
@@ -12,7 +11,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 print("Project root:", os.getcwd())
 from model.model import WaveCrossMamba, AnomalyDetectionModel
-from utils.dataloader import PredictDataset
 kmer_encode_dic={'A': 0, "C": 1, "G": 2, "T": 3}
 
 class PredictIterableDataset(IterableDataset):
