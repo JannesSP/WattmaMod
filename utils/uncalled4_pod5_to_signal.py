@@ -1,33 +1,14 @@
-from typing import Dict
 import argparse, sys, os
 import pysam, pod5
 import numpy as np
 from array import array as pyarray
 from pathlib import Path
-from tqdm.auto import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from tqdm.auto import tqdm
-import zstandard as zstd
+from utils.zstd import write_zstd
 REF_DICT = None
 P5_READER = None
 P5_PATH = None
-
-def open_zstd_writer(path, level=3) -> tuple:
-    """
-    Open a UTF-8 text writer compressed with zstd.
-    Returns
-    -------
-    stream : zstd.ZstdCompressionWriter
-        A stream writer that can be used to write text data.
-    fh : file object
-        The underlying file object that was opened for writing.
-    """
-    if not path.endswith(".zst"):
-        path += ".zst"
-    fh = open(path, "wb")
-    compressor = zstd.ZstdCompressor(level=level)
-    stream = compressor.stream_writer(fh)
-    return stream, fh
 
 def reverse_non_gap_segments(parts, dwell_padded, ref_aligned_sequence, na_token="NA"):
     n = len(parts)
@@ -81,7 +62,7 @@ def load_signal_dict(pod5_path):
                     signal_dict[str(read.read_id)] = np.asarray(sig, dtype=np.int32)
     return signal_dict
 
-def load_fasta_dict(reference: str) -> Dict[str, str]:
+def load_fasta_dict(reference: str) -> dict[str, str]:
     fa = pysam.FastaFile(reference)
     d = {}
 
@@ -402,11 +383,11 @@ def main(args):
     REF_DICT = load_fasta_dict(args.ref)
     
     with pysam.AlignmentFile(args.bam, "rb") as bam:
-        zstd_stream, raw_out = open_zstd_writer(args.out)
+        zstd_stream, raw_out = write_zstd(args.out)
         out = zstd_stream
                 
         try:
-            out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n".encode("utf-8"))
+            out.write("read_id\tchrom\tstart\tref_sequence\tqualities\tsequence\tdwell_time\tsignal\n")
             if args.workers and args.workers > 1:
                 with ProcessPoolExecutor(max_workers=args.workers,initializer=init_worker,
                     initargs=(args.pod5, REF_DICT),) as ex:
@@ -416,10 +397,11 @@ def main(args):
                         total=None,
                         unit="reads",
                         desc="Processing BAM",
-                        dynamic_ncols=True,
+                        dynamic_ncols=False,
+                        mininterval=60,
                     ):
                         if line:
-                            out.write(f"{line}\n".encode("utf-8"))
+                            out.write(f"{line}\n")
             else:
                 with pod5.DatasetReader(args.pod5) as p5:
                     it = bam.fetch(until_eof=True)
@@ -428,7 +410,8 @@ def main(args):
                         total=None,
                         unit="reads",
                         desc="Processing BAM",
-                        dynamic_ncols=True,
+                        dynamic_ncols=False,
+                        mininterval=60,
                     ):
                         if rec.is_unmapped or rec.is_secondary or rec.is_supplementary:
                             continue
@@ -482,15 +465,17 @@ def main(args):
                                 dwell_str,
                                 signal,
                             )
-                            out.write(f"{line}\n".encode("utf-8"))
+                            out.write(f"{line}\n")
 
                         except Exception as e:
                             print(f"Error processing read {read_id}: {e}", file=sys.stderr)
                             continue
         finally:
-            zstd_stream.flush(zstd.FLUSH_FRAME)
-            zstd_stream.close()
-            raw_out.close()
+            out.close()
+            if raw_out is not None:
+                stream, fh = raw_out
+                stream.close()
+                fh.close()
 
 
 if __name__ == "__main__":

@@ -1,15 +1,18 @@
-import argparse, sys, os, traceback
-from typing import Dict, Tuple, List
+import argparse
+import traceback
 import numpy as np
+import re
+import sys
+from pathlib import Path
 from scipy import interpolate
 from statsmodels import robust
-import sys
-import numpy as np
-from statsmodels import robust
-import re
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-def motif_center_indices(sequence: str, motif_regex) -> List[int]:
+from utils.zstd import read_zstd, write_zstd
+
+def motif_center_indices(sequence: str, motif_regex) -> list[int]:
     n = len(sequence)
     idx = []
     if n < 5:
@@ -19,6 +22,7 @@ def motif_center_indices(sequence: str, motif_regex) -> List[int]:
         if motif_regex is None or motif_regex.fullmatch(kmer):
             idx.append(i)
     return idx
+
 def interp(x):
     x = np.asarray(x, dtype=float)
     l = len(x)
@@ -34,6 +38,7 @@ def interp(x):
     y_new = f(x_new)
     y_new = np.around(y_new, 4)
     return y_new.tolist()
+
 def convert_base_name(base_name):
     merge_bases = {
         'A': 'A',
@@ -56,9 +61,10 @@ def convert_base_name(base_name):
     for base in base_name:
         pattern += merge_bases.get(base, base)
     return pattern
+
 def extract_5mer_features(signal_file: str, args):
     motif_regex = re.compile(convert_base_name(args.motif)) if args.motif else None
-    out = open(args.out, "w", encoding="utf-8")
+    out, raw_out = write_zstd(args.out)
     header = [
         "read_id","chr","pos1","5mer",
         "mean","std","median","length","base_qual",
@@ -66,8 +72,9 @@ def extract_5mer_features(signal_file: str, args):
     ]
     out.write("\t".join(header) + "\n")
     count = 0
-    with open(signal_file, "r", encoding="utf-8") as f:
+    f, raw = read_zstd(signal_file)
         
+    try:
         for line in f:
             try:
                 line = line.rstrip("\n")
@@ -164,15 +171,26 @@ def extract_5mer_features(signal_file: str, args):
             except Exception as e:
                 print(e, file=sys.stderr)
                 traceback.print_exc()
-    out.close()
+
+    finally:
+        f.close()
+        if raw is not None:
+            raw.close()
+        out.close()
+        if raw_out is not None:
+            stream, fh = raw_out
+            stream.close()
+            fh.close()
+    
     print(f"[*] done. total {count} 5-mer features → {args.out}", file=sys.stderr)
 
 def main():
     ap = argparse.ArgumentParser(description="Extract 5-mer signal features based on sequence consistency and motif scanning.")
-    ap.add_argument("--signal", required=False,default="/mnt/sunxh/Datasets_RNA/ivt_RNA004/m6a_uncalled4_output1.tsv")
-    ap.add_argument("--motif", required=False, default="NNANN",help="5-mer IUPAC pattern (exact match)")
-    ap.add_argument("--out","-o", required=False,default="/mnt/sunxh/Datasets_RNA/ivt_RNA004/feature.tsv")
+    ap.add_argument("-s", "--signal", required=True, type=str, help="Input signal file (.zst-compressed)")
+    ap.add_argument("-m", "--motif", required=True, type=str, help="5-mer IUPAC pattern (exact match)")
+    ap.add_argument("-o", "--out", required=True, type=str, help="Output feature file (.zst-compressed)")
     args = ap.parse_args()
     extract_5mer_features(args.signal, args)
+
 if __name__ == "__main__":
     main()

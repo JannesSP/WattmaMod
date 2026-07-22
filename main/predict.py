@@ -1,21 +1,25 @@
+import argparse
+import gc
+import numpy as np
 import os
 import sys
-import argparse
-import numpy as np
 import torch
-from torch.utils.data import DataLoader, get_worker_info, IterableDataset
+from tqdm import tqdm
 from pathlib import Path
-CUR_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CUR_DIR.parent
+from torch.utils.data import DataLoader, get_worker_info, IterableDataset
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-os.chdir(PROJECT_ROOT)
-print("Project root:", os.getcwd())
+
 from model.model import WaveCrossMamba, AnomalyDetectionModel
+from utils.zstd import read_zstd, write_zstd
+
+print("Project root:", os.getcwd(), file=sys.stderr)
 kmer_encode_dic={'A': 0, "C": 1, "G": 2, "T": 3}
 
 class PredictIterableDataset(IterableDataset):
     def __init__(self, file_path):
-        super(PredictIterableDataset).__init__()
+        super().__init__()
         self.file_path = file_path
     def parse_line(self, line):
         items = line.strip().split("\t")
@@ -46,7 +50,9 @@ class PredictIterableDataset(IterableDataset):
             y = "|".join([contig, position, motif, read_id])
             return x, y
         except Exception as e:
-            return None
+            print("Parse error:", e, file=sys.stderr)
+            print(line, file=sys.stderr)
+            raise
 
 
     def __iter__(self):
@@ -56,16 +62,26 @@ class PredictIterableDataset(IterableDataset):
         else:
             worker_id, num_workers = info.id, info.num_workers
 
-        with open(self.file_path, "r") as f:
+        f, raw = read_zstd(self.file_path)
+        try:
+            # skip first line, which is the header
+            next(f)
             for i, line in enumerate(f):
                 if i % num_workers != worker_id:
                     continue
+
                 result = self.parse_line(line)
                 if result is not None:
                     yield result
+        finally:
+            f.close()
+            if raw is not None:
+                raw.close()
 
 def predict_model(pretrain_model, model, test_loader, device, output_predict, max_write=None):
-    with open(output_predict, "w") as predict_result:
+    predict_result, raw = write_zstd(output_predict)
+
+    try:
         model.to(device)
         pretrain_model.to(device)
         model.eval()
@@ -75,7 +91,21 @@ def predict_model(pretrain_model, model, test_loader, device, output_predict, ma
         written = 0
 
         with torch.no_grad():
+
+            print("Starting prediction...", file=sys.stderr)
+
+            pbar = tqdm(
+                total=max_write,
+                unit="reads",
+                desc="Predicting",
+                file=sys.stderr,
+                mininterval=30,       # update at most every 30 seconds
+                dynamic_ncols=False,  # better for Slurm log files
+                leave=True
+            )
+            
             for batch_idx, (data, batch_y) in enumerate(test_loader):
+                # print("Got batch", batch_idx, file=sys.stderr)
                 if max_write is not None and written >= max_write:
                     break
 
@@ -105,30 +135,34 @@ def predict_model(pretrain_model, model, test_loader, device, output_predict, ma
                     contig_full = "|".join(parts[:-3])
                     contig = contig_full.split("|", 1)[0]
 
-                    print("%s\t%s\t%s\t%s\t%s\t%s" % (
-                        contig,
-                        position,
-                        motif,
-                        read_id,
-                        label_dict[int(pred[j])],
-                        float(probabilities[j])
-                    ), file=predict_result)
+                    print(
+                        f"{contig}\t{position}\t{motif}\t{read_id}\t{label_dict[int(pred[j])]}\t{float(probabilities[j])}",
+                        file=predict_result
+                    )
 
                 written += take
-                if (written % 1_000_000) < take:
-                    print(f"[INFO]  {written} ")
+                pbar.update(take)
+            
+    finally:
 
-        return written
+        pbar.close()
+        predict_result.close()
+        if raw is not None:
+            stream, fh = raw
+            stream.close()
+            fh.close()
+        
+    print(f"Prediction completed. Total reads written: {written}", file=sys.stderr)
 
-import gc, torch
+    return written
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_dataset = PredictIterableDataset(args.input)
     test_loader = DataLoader(
         dataset=test_dataset,
-        batch_size=10000, 
-        num_workers=4,
+        batch_size=10_000, 
+        num_workers=0,
         pin_memory=True
     )
 
@@ -136,9 +170,8 @@ def main(args):
     fine_tune_model  = AnomalyDetectionModel(feature_dim=128, num_classes=2).to(device)
     pretrained_feature_extractor.load_state_dict(torch.load(args.pre,map_location=device))
     fine_tune_model.load_state_dict(torch.load(args.fine, map_location=device))
-    max_n = getattr(args, "max_n", 8_000_000)
 
-    n_written = predict_model(pretrained_feature_extractor, fine_tune_model, test_loader, device, args.o, max_write=max_n)
+    n_written = predict_model(pretrained_feature_extractor, fine_tune_model, test_loader, device, args.output, args.max_n)
     del pretrained_feature_extractor, fine_tune_model, test_loader, test_dataset
     gc.collect()
     if torch.cuda.is_available():
@@ -147,11 +180,12 @@ def main(args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='WattmaMod: multi-type RNA modification prediction.')
-    parser.add_argument('--pre', type=str, required=True,help='Path to the pretrained encoder checkpoint (.pth).')
-    parser.add_argument('--fine', type=str, required=True,help='Path to the fine-tuned classifier checkpoint (.pth).')
-    parser.add_argument('--o', '-output_predict', type=str, required=True,help='Output file (TSV).')
-    parser.add_argument('--input', '--input_data_file', type=str, required=True,help='Input TSV file for prediction.')
-    parser.add_argument('--gpu', type=str, default="0",help='GPU device id(s) to use, e.g., "0", "1".')
+    parser.add_argument('-p', '--pre', type=str, required=True, help='Path to the pretrained encoder checkpoint (.pth).')
+    parser.add_argument('-f', '--fine', type=str, required=True, help='Path to the fine-tuned classifier checkpoint (.pth).')
+    parser.add_argument('-o', '--output', type=str, required=True, help='Output file (TSV), will be zst compressed (lvl 3).')
+    parser.add_argument('-i', '--input', type=str, required=True, help='Input TSV file for prediction.')
+    parser.add_argument('-g', '--gpu', type=str, default="0", help='GPU device id(s) to use, e.g., "0", "1".')
+    parser.add_argument('-m', '--max_n', type=int, default=None, help='Maximum number of reads to predict (default: all).')
 
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
