@@ -4,40 +4,39 @@ import numpy as np
 import re
 import sys
 from pathlib import Path
-from scipy import interpolate
 from statsmodels import robust
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.zstd import read_zstd, write_zstd
 
-def motif_center_indices(sequence: str, motif_regex) -> list[int]:
-    n = len(sequence)
-    idx = []
-    if n < 5:
-        return idx
-    for i in range(2, n-2):
-        kmer = sequence[i-2:i+3]
-        if motif_regex is None or motif_regex.fullmatch(kmer):
-            idx.append(i)
-    return idx
+# def motif_center_indices(sequence: str, motif_regex) -> list[int]:
+#     n = len(sequence)
+#     idx = []
+#     if n < 5:
+#         return idx
+#     for i in range(2, n-2):
+#         kmer = sequence[i-2:i+3]
+#         if motif_regex is None or motif_regex.fullmatch(kmer):
+#             idx.append(i)
+#     return idx
 
 def interp(x):
-    x = np.asarray(x, dtype=float)
+    x = np.asarray(x, dtype=np.float32)
     l = len(x)
+
     if l == 0:
-        print("[!] empty segment for interpolation", file=sys.stderr)
         return []
+
     if l == 1:
-        return [float(np.round(x[0], 4))] * 100
-    y = x
-    x = np.linspace(0, l - 1, l)
-    f = interpolate.interp1d(x, y, kind='slinear')
-    x_new = np.linspace(0, l - 1, 100)
-    y_new = f(x_new)
-    y_new = np.around(y_new, 4)
-    return y_new.tolist()
+        return [round(float(x[0]), 4)] * 100
+
+    xp = np.linspace(0, 1, l)
+    xnew = np.linspace(0, 1, 100)
+
+    return np.round(np.interp(xnew, xp, x), 4).tolist()
 
 def convert_base_name(base_name):
     merge_bases = {
@@ -71,11 +70,14 @@ def extract_5mer_features(signal_file: str, args):
         "sig_-2","sig_-1","sig_0","sig_+1","sig_+2"
     ]
     out.write("\t".join(header) + "\n")
+
     count = 0
+    out_buffer = []
+    buffer_size = 10000   # number of output lines before writing
     f, raw = read_zstd(signal_file)
         
     try:
-        for line in f:
+        for line in tqdm(f, desc="Processing reads", unit=" reads", file=sys.stderr, mininterval=30):
             try:
                 line = line.rstrip("\n")
                 if not line or line.startswith("read_id"):
@@ -93,17 +95,14 @@ def extract_5mer_features(signal_file: str, args):
                 dwell_list = [int(x) for x in dwell.split(",") if x != ""]
 
                 per_base_segments = []
-                tokens = []
                 for part in sig_str.split("|"):
-                    seg = np.fromstring(part, sep=",", dtype=float)
+                    seg = np.fromstring(part, sep=",", dtype=np.float32)
                     seg = seg[np.isfinite(seg)]
                     per_base_segments.append(seg)
-                    tokens.extend(seg)
+                full_signal = np.concatenate(per_base_segments)
 
-                full_signal = np.asarray(tokens, dtype=float)
                 if full_signal.size == 0:
                     continue
-                full_signal = full_signal[np.isfinite(full_signal)]
                 full_signal_uniq = np.unique(full_signal)
                 med = float(np.median(full_signal_uniq))
                 mad = float(robust.mad(full_signal_uniq))
@@ -119,7 +118,7 @@ def extract_5mer_features(signal_file: str, args):
                     kmer_sequence = sequence[i-2:i+3]
                     if motif_regex and not motif_regex.fullmatch(kmer_sequence):
                         continue
-                    if sequence[i-2:i+3] != ref_seq[i-2:i+3]:
+                    if kmer_sequence != ref_seq[i-2:i+3]:
                         continue
                     if i+2 >= len(per_base_segments):
                         break
@@ -133,11 +132,16 @@ def extract_5mer_features(signal_file: str, args):
                     ]
                     
                     five_norm = [(s - med) / mad for s in five_segments]
-                    five_interp = [interp(s) for s in five_norm]
 
-                    means   = [float(np.round(np.mean(s),   3)) for s in five_norm]
-                    stds    = [float(np.round(np.std(s),    3)) for s in five_norm]
-                    medians = [float(np.round(np.median(s), 3)) for s in five_norm]
+                    means = []
+                    stds = []
+                    medians = []
+                    five_interp = []
+                    for s in five_norm:
+                        means.append(float(np.round(np.mean(s), 3)))
+                        stds.append(float(np.round(np.std(s), 3)))
+                        medians.append(float(np.round(np.median(s), 3)))
+                        five_interp.append(interp(s))
 
                     length5 = dwell_list[i-2:i+3]
                     baseq5  = base_quality_list[i-2:i+3]
@@ -146,7 +150,7 @@ def extract_5mer_features(signal_file: str, args):
                     offset = non_gap_prefix[i]
                     pos1 = start + offset
 
-                    out.write(
+                    out_buffer.append(
                         "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" % (
                             read_id, chrom, pos1, kmer_sequence,
                             "|".join(map(str, means)),
@@ -161,13 +165,13 @@ def extract_5mer_features(signal_file: str, args):
                             "|".join(map(str, five_interp[4])),
                         )
                     )
+
+                    if len(out_buffer) >= buffer_size:
+                        out.write("".join(out_buffer))
+                        out_buffer.clear()
                     
                     count += 1
 
-                    if count % 50000 == 0:
-                        print(f"[+] processed {count} sites", file=sys.stderr)
-                if count >= 2e6:
-                    break
             except Exception as e:
                 print(e, file=sys.stderr)
                 traceback.print_exc()
@@ -176,6 +180,11 @@ def extract_5mer_features(signal_file: str, args):
         f.close()
         if raw is not None:
             raw.close()
+
+        if out_buffer:
+            out.write("".join(out_buffer))
+            out_buffer.clear()
+            
         out.close()
         if raw_out is not None:
             stream, fh = raw_out
